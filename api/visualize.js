@@ -1,6 +1,7 @@
 // Vercel Serverless Function — /api/visualize
 //   GET  → { remainingGenerations }            (read-only, no Gemini call)
-//   POST → { imageUrl, remainingGenerations }  (edits the user's photo with Gemini)
+//   POST → { imageUrl, remainingGenerations }  (edits the user's photo with Gemini 3.1 Flash Image
+//                                              via the Interactions API, POST /v1beta/interactions)
 //
 // Required env vars (Vercel → Settings → Environment Variables):
 //   GEMINI_API_KEY                         Gemini key (server-side only)
@@ -15,7 +16,8 @@
 
 const MAX_GENERATIONS = 20; // total AI generations allowed for the whole site
 
-const MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image';
+const MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
+const INTERACTIONS_URL = 'https://generativelanguage.googleapis.com/v1beta/interactions';
 const MAX_IMAGE_CHARS = 4 * 1024 * 1024; // Vercel caps request bodies at 4.5MB
 const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
 const COUNTER_KEY = 'hestia:visualize:generations';
@@ -49,6 +51,25 @@ function parseDataUrl(dataUrl) {
   const match = /^data:([^;]+);base64,(.+)$/s.exec(dataUrl || '');
   if (!match) return null;
   return { mime: match[1], base64: match[2] };
+}
+
+// Interactions API response: the final image is an `image` content block
+// ({ type, data, mime_type }) inside a `model_output` step. `thought` steps may
+// carry interim composition images, which are ignored. Returns the last image
+// block of the model output, or null.
+function extractOutputImage(interaction) {
+  const steps = (interaction && Array.isArray(interaction.steps)) ? interaction.steps : [];
+  let found = null;
+  for (const step of steps) {
+    if (!step || step.type !== 'model_output' || !Array.isArray(step.content)) continue;
+    for (const block of step.content) {
+      if (block && block.type === 'image' && block.data) found = block;
+    }
+  }
+  if (!found && interaction && interaction.output_image && interaction.output_image.data) {
+    found = interaction.output_image;
+  }
+  return found;
 }
 
 // ---- Handler ----
@@ -132,23 +153,18 @@ async function handler(req, res) {
   if (material) promptParts.push(`Material/acabamento: ${material}.`);
 
   try {
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        body: JSON.stringify({
-          contents: [{
-            role: 'user',
-            parts: [
-              { text: promptParts.join(' ') },
-              { inlineData: { mimeType: parsed.mime, data: parsed.base64 } },
-            ],
-          }],
-          generationConfig: { responseModalities: ['TEXT', 'IMAGE'] },
-        }),
-      }
-    );
+    const geminiRes = await fetch(INTERACTIONS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        model: MODEL,
+        input: [
+          { type: 'text', text: promptParts.join(' ') },
+          { type: 'image', mime_type: parsed.mime, data: parsed.base64 },
+        ],
+        response_format: { type: 'image' },
+      }),
+    });
 
     const data = await geminiRes.json().catch(() => ({}));
 
@@ -163,25 +179,23 @@ async function handler(req, res) {
       return res.status(502).json({ message, remainingGenerations: remainingFrom(used - 1) });
     }
 
-    const parts = (data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-    const imgPart = parts.find((p) => p.inlineData || p.inline_data);
-    const inline = imgPart && (imgPart.inlineData || imgPart.inline_data);
+    const outImage = extractOutputImage(data);
 
-    if (!inline || !inline.data) {
+    if (!outImage) {
       await refund();
-      const blocked = data && data.promptFeedback && data.promptFeedback.blockReason;
+      // Safe debugging info only: interaction status and step types, never payloads or the key.
+      const stepTypes = Array.isArray(data && data.steps) ? data.steps.map((s) => s && s.type) : [];
+      console.error('Gemini returned no image', { status: data && data.status, stepTypes });
       return res.status(502).json({
-        message: blocked
-          ? 'O pedido foi bloqueado pelos filtros de segurança da IA. Tente descrever de outra forma.'
-          : 'A IA não retornou nenhuma imagem para este pedido. Tente descrever de outra forma.',
+        message: 'A IA não retornou nenhuma imagem para este pedido. Tente descrever de outra forma.',
         remainingGenerations: remainingFrom(used - 1),
       });
     }
 
-    const outMime = inline.mimeType || inline.mime_type || 'image/png';
+    const outMime = outImage.mime_type || outImage.mimeType || 'image/png';
     // Nothing is stored — the generated image goes straight back to the browser.
     return res.status(200).json({
-      imageUrl: `data:${outMime};base64,${inline.data}`,
+      imageUrl: `data:${outMime};base64,${outImage.data}`,
       remainingGenerations: remainingFrom(used),
     });
   } catch (err) {
